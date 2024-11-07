@@ -1,0 +1,181 @@
+trigger: none
+
+variables:
+  - name: sourceSubscription
+    value: 'source-subscription-name'
+  - name: targetSubscription
+    value: 'target-subscription-name'
+  - name: sourceStorageAccount
+    value: 'source-storage-name'
+  - name: targetStorageAccount
+    value: 'target-storage-name'
+  
+  # Optimized transfer settings for ExpressRoute
+  - name: blockSize
+    value: '256MB'  # Larger block size for high-bandwidth connections
+  - name: concurrency
+    value: '128'    # Higher concurrency for ExpressRoute
+  - name: maxRetries
+    value: '10'
+  - name: batchSize
+    value: '50000'  # Larger batch size for table operations
+
+stages:
+- stage: PreMigrationSetup
+  jobs:
+  - job: PrepareStorage
+    timeoutInMinutes: 30
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+    - task: AzureCLI@2
+      name: ConfigureStorageNetworking
+      inputs:
+        azureSubscription: $(targetSubscription)
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          # Enable private endpoints for both storage accounts
+          az storage account update \
+            --name $(targetStorageAccount) \
+            --allow-shared-key-access true \
+            --default-action Deny \
+            --bypass AzureServices
+
+          # Configure storage account for maximum throughput
+          az storage account update \
+            --name $(targetStorageAccount) \
+            --routing-choice InternetRouting \
+            --publish-internet-endpoints false \
+            --publish-microsoft-endpoints true
+
+- stage: MigrateStorage
+  dependsOn: PreMigrationSetup
+  jobs:
+  - job: Migration
+    timeoutInMinutes: 4320  # 72 hours
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+    - task: AzureCLI@2
+      name: GenerateSAS
+      inputs:
+        azureSubscription: $(sourceSubscription)
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          # Generate long-lived SAS for large transfer
+          source_sas=$(az storage account generate-sas \
+            --permissions r \
+            --account-name $(sourceStorageAccount) \
+            --services bfqt \
+            --resource-types sco \
+            --expiry $(date -u -d "7 days" '+%Y-%m-%dT%H:%MZ') -o tsv)
+          echo "##vso[task.setvariable variable=SOURCE_SAS;isOutput=true]$source_sas"
+
+    - task: AzureCLI@2
+      name: MigrateData
+      inputs:
+        azureSubscription: $(targetSubscription)
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          # Install latest azcopy
+          wget https://aka.ms/downloadazcopy-v10-linux
+          tar -xvf downloadazcopy-v10-linux
+          sudo cp ./azcopy_linux_amd64_*/azcopy /usr/bin/
+          
+          # Generate target SAS
+          target_sas=$(az storage account generate-sas \
+            --permissions rwl \
+            --account-name $(targetStorageAccount) \
+            --services bfqt \
+            --resource-types sco \
+            --expiry $(date -u -d "7 days" '+%Y-%m-%dT%H:%MZ') -o tsv)
+          
+          # Create segments for parallel processing
+          mkdir -p migration_logs
+          
+          echo "Starting Blob Migration..."
+          # Get list of containers
+          containers=$(az storage container list \
+            --account-name $(sourceStorageAccount) \
+            --sas-token $(SOURCE_SAS) \
+            --query "[].name" -o tsv)
+          
+          # Migrate containers in parallel
+          for container in $containers; do
+            echo "Migrating container: $container"
+            azcopy copy \
+              "https://$(sourceStorageAccount).blob.core.windows.net/${container}?$(SOURCE_SAS)" \
+              "https://$(targetStorageAccount).blob.core.windows.net/${container}?$target_sas" \
+              --recursive \
+              --check-length=true \
+              --block-size-mb=$(blockSize) \
+              --parallel-level=$(concurrency) \
+              --retry-count=$(maxRetries) \
+              --output-type=json \
+              --log-file=migration_logs/${container}_migration.log &
+            
+            # Allow up to 5 parallel container migrations
+            if [[ $(jobs -r | wc -l) -ge 5 ]]; then
+              wait -n
+            fi
+          done
+          
+          # Wait for all container migrations to complete
+          wait
+          
+          echo "Starting File Share Migration..."
+          # Similar parallel approach for file shares
+          shares=$(az storage share list \
+            --account-name $(sourceStorageAccount) \
+            --sas-token $(SOURCE_SAS) \
+            --query "[].name" -o tsv)
+          
+          for share in $shares; do
+            echo "Migrating share: $share"
+            azcopy copy \
+              "https://$(sourceStorageAccount).file.core.windows.net/${share}?$(SOURCE_SAS)" \
+              "https://$(targetStorageAccount).file.core.windows.net/${share}?$target_sas" \
+              --recursive \
+              --block-size-mb=$(blockSize) \
+              --parallel-level=$(concurrency) \
+              --retry-count=$(maxRetries) \
+              --output-type=json \
+              --log-file=migration_logs/${share}_migration.log &
+            
+            if [[ $(jobs -r | wc -l) -ge 3 ]]; then
+              wait -n
+            fi
+          done
+          
+          wait
+          
+          echo "Starting Table Migration..."
+          tables=$(az storage table list \
+            --account-name $(sourceStorageAccount) \
+            --sas-token $(SOURCE_SAS) \
+            --query "[].name" -o tsv)
+          
+          for table in $tables; do
+            echo "Migrating table: $table"
+            az storage table create \
+              --name $table \
+              --account-name $(targetStorageAccount) \
+              --sas-token $target_sas
+            
+            az storage entity copy \
+              --source-account-name $(sourceStorageAccount) \
+              --source-table $table \
+              --source-sas $(SOURCE_SAS) \
+              --destination-account-name $(targetStorageAccount) \
+              --destination-table $table \
+              --destination-sas $target_sas \
+              --batch-size $(batchSize)
+          done
+
+    - task: PublishBuildArtifacts@1
+      inputs:
+        pathToPublish: 'migration_logs'
+        artifactName: 'MigrationLogs'
