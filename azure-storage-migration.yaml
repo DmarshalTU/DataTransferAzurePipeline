@@ -1,0 +1,372 @@
+trigger: none # Manual trigger only
+
+parameters:
+  # Transfer settings
+  - name: blockSize
+    type: number
+    default: 256
+  - name: concurrency
+    type: number
+    default: 128
+  - name: batchSize
+    type: number
+    default: 50000
+
+  # Time filter
+  - name: modifiedSince
+    type: string
+    default: '3months'
+    values:
+      - '7days'
+      - '1month'
+      - '3months'
+      - '6months'
+      - '1year'
+      - 'all'
+
+variables:
+  SOURCE_ACCOUNT: QWERTY
+  TARGET_ACCOUNT: ASDFG
+  AZURE_STORAGE_AUTH_MODE: key
+  AZURE_LOG_LEVEL: INFO
+  AZCOPY_PRESERVE_PROPERTIES: true
+
+stages:
+- stage: PreMigrationSetup
+  jobs:
+  - job: PrepareStorage
+    timeoutInMinutes: 30
+    pool:
+      name: 'iac-devops-pool'
+    steps:
+    - task: AzureCLI@2
+      name: ConfigureStorageNetworking
+      inputs:
+        azureSubscription: ASDFGSUB
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          # Enable private endpoints for target storage
+          az storage account update \
+            --only-show-errors \
+            --name ASDFG \
+            --allow-shared-key-access true \
+            --default-action Deny \
+            --bypass AzureServices \
+            --only-show-errors
+          
+          # Configure storage account for maximum throughput
+          az storage account update \
+            --only-show-errors \
+            --name ASDFG \
+            --routing-choice InternetRouting \
+            --publish-internet-endpoints false \
+            --publish-microsoft-endpoints true \
+            --only-show-errors
+        addSpnToEnvironment: true
+
+
+- stage: MigrateStorage
+  dependsOn: PreMigrationSetup
+  jobs:
+  - job: Migration
+    timeoutInMinutes: 4320  # 72 hours
+    pool:
+      name: 'iac-devops-pool'
+    steps:
+    - task: AzureCLI@2
+      name: GenerateSourceSAS
+      inputs:
+        azureSubscription: QWERTYSUB
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          # Calculate cutoff date
+          if [ "${{ parameters.modifiedSince }}" != "all" ]; then
+            case ${{ parameters.modifiedSince }} in
+              "7days") cutoff_date=$(date -d "7 days ago" +%Y-%m-%d);;
+              "1month") cutoff_date=$(date -d "1 month ago" +%Y-%m-%d);;
+              "3months") cutoff_date=$(date -d "3 months ago" +%Y-%m-%d);;
+              "6months") cutoff_date=$(date -d "6 months ago" +%Y-%m-%d);;
+              "1year") cutoff_date=$(date -d "1 year ago" +%Y-%m-%d);;
+            esac
+            echo "##vso[task.setvariable variable=CUTOFF_DATE]$cutoff_date"
+            echo "Migrating files modified since: $cutoff_date"
+          else
+            echo "Migrating all files"
+          fi
+
+          # Generate SAS token for source with read access
+          source_sas=$(az storage account generate-sas \
+            --permissions rlf \
+            --account-name QWERTY \
+            --services bft \
+            --resource-types sco \
+            --expiry "$(date -u -d "7 days" '+%Y-%m-%dT%H:%MZ')" \
+            --only-show-errors \
+            -o tsv)
+          
+          echo "##vso[task.setvariable variable=SOURCE_SAS;]$source_sas"
+          
+          # Verify SAS token works
+          if ! az storage container list \
+            --account-name QWERTY \
+            --sas-token "$source_sas" \
+            --only-show-errors; then
+            echo "Error: Source SAS token verification failed"
+            exit 1
+          fi
+          echo "Source SAS token generated and verified successfully"
+
+    - task: AzureCLI@2
+      name: GenerateTargetSAS
+      inputs:
+        azureSubscription: ASDFGSUB
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          # Generate SAS token for target with full access
+          target_sas=$(az storage account generate-sas \
+            --permissions rwdlacup \
+            --account-name ASDFG \
+            --services bft \
+            --resource-types sco \
+            --expiry "$(date -u -d "7 days" '+%Y-%m-%dT%H:%MZ')" \
+            --only-show-errors \
+            -o tsv)
+          
+          echo "##vso[task.setvariable variable=TARGET_SAS;]$target_sas"
+          
+          # Verify SAS token works
+          if ! az storage container create \
+            --name "pipeline-check-container-t1" \
+            --account-name ASDFG \
+            --sas-token "$target_sas" \
+            --only-show-errors; then
+            echo "Error: Target SAS token feild"
+            exit 1
+          fi
+
+          secs=$((10))
+          while [ $secs -gt 0 ]; do
+            echo -ne "Resting for $secs\033[0K\r seconds...\n"
+            sleep 1
+            : $((secs--))
+          done
+
+          # Cleanup
+          az storage container delete\
+            --name "pipeline-check-container-t1" \
+            --account-name ASDFG \
+            --sas-token "$target_sas" \
+            --only-show-errors
+            
+          echo "Target SAS token generated and verified successfully"
+          
+    - task: AzureCLI@2
+      name: SourceTargetVerification
+      inputs:
+        azureSubscription: QWERTYSUB
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+        
+          echo "$(TARGET_SAS)"
+          # Verify target SAS token works
+          if ! az storage container create \
+            --name "pipeline-check-container-t2" \
+            --account-name ASDFG \
+            --sas-token "$(TARGET_SAS)" \
+            --only-show-errors; then
+            echo "Error: Target SAS token feild"
+            exit 1
+          fi
+
+          secs=$((10))
+          while [ $secs -gt 0 ]; do
+            echo -ne "Resting for $secs\033[0K\r seconds...\n"
+            sleep 1
+            : $((secs--))
+          done
+
+          # Cleanup
+          az storage container delete\
+            --name "pipeline-check-container-t2" \
+            --account-name ASDFG \
+            --sas-token "$(TARGET_SAS)" \
+            --only-show-errors
+          
+          echo "Target SAS token verified successfully in Source Sub"
+
+    - task: AzureCLI@2
+      name: PrepareSourceData
+      inputs:
+        azureSubscription: QWERTYSUB
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          mkdir -p migration_lists migration_logs
+          
+          # Get and verify resource lists
+          for type in "containers" "shares"; do
+            echo "Checking for ${type}..."
+            case $type in
+              "containers")
+                az storage container list \
+                  --account-name QWERTY \
+                  --sas-token "$(SOURCE_SAS)" \
+                  --query "[].name" -o tsv > "migration_lists/${type}.txt"
+                ;;
+              "shares")
+                az storage share list \
+                  --account-name QWERTY \
+                  --sas-token "$(SOURCE_SAS)" \
+                  --query "[].name" -o tsv > "migration_lists/${type}.txt"
+                ;;
+            esac
+            
+            if [ $? -ne 0 ]; then
+              echo "Error: Failed to list ${type}"
+              exit 1
+            fi
+            
+            count=0
+            if [ -s "migration_lists/${type}.txt" ]; then
+              count=$(wc -l < "migration_lists/${type}.txt")
+            fi
+            echo "Found $count ${type} to process"
+            touch "migration_lists/${type}.txt"
+          done
+
+    - task: AzureCLI@2
+      name: PerformMigration
+      inputs:
+        azureSubscription: QWERTYSUB
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          summary_log="migration_logs/migration_summary.log"
+          echo "Migration Summary - Started at $(date)" > $summary_log
+          total_start_time=$(date +%s)
+          
+          # Process containers
+          if [ -s "migration_lists/containers.txt" ]; then
+            echo "=== Blob Migration ===" >> $summary_log
+            blob_start_time=$(date +%s)
+            
+            # Read containers into array
+            readarray -t CONTAINERS < migration_lists/containers.txt
+            total_containers=${#CONTAINERS[@]}
+            echo "Total containers to process: $total_containers"
+            
+            # Process each container
+            for container in "${CONTAINERS[@]}"; do
+              container_start_time=$(date +%s)
+              echo "Processing container: $container"
+              
+              # Check for matching blobs
+              if [ -n "$(CUTOFF_DATE)" ]; then
+                matching_blobs=$(az storage blob list \
+                  --container-name "$container" \
+                  --account-name QWERTY \
+                  --sas-token "$(SOURCE_SAS)" \
+                  --query "[?properties.lastModified >= '${CUTOFF_DATE}'].name" \
+                  --only-show-errors -o tsv 2>&1 || echo "")
+                
+                if [ -z "$matching_blobs" ]; then
+                  echo "Skipping container $container - no blobs modified since $(CUTOFF_DATE)"
+                  continue
+                fi
+                echo "Found matching blobs in container $container"
+              fi
+              
+              # Create container in target
+              az storage container create \
+                --name "$container" \
+                --account-name ASDFG \
+                --sas-token "$(TARGET_SAS)" \
+                --only-show-errors 2>&1 || true
+                
+              # Run azcopy in background and wait
+              (
+                azcopy copy \
+                  "https://QWERTY.blob.core.windows.net/${container}?$(SOURCE_SAS)" \
+                  "https://ASDFG.blob.core.windows.net/${container}?$(TARGET_SAS)" \
+                  --recursive \
+                  --block-size-mb=${{ parameters.blockSize }} \
+                  --cap-mbps=${{ parameters.concurrency }} \
+                  --include-after "$(CUTOFF_DATE)" \
+                  --log-level=ERROR \
+                  --output-type=text
+              ) &
+              
+              # Store PID of background process
+              azcopy_pid=$!
+              
+              # Wait for azcopy to complete
+              wait $azcopy_pid || true
+              
+              container_end_time=$(date +%s)
+              container_duration=$((container_end_time - container_start_time))
+              echo "✓ Container $container completed in ${container_duration} seconds" >> $summary_log
+              echo "✓ Completed container $container (${container_duration}s)"
+              
+              # Force continue
+              set +e
+              true
+              
+            done
+            
+            blob_end_time=$(date +%s)
+            blob_duration=$((blob_end_time - blob_start_time))
+            echo "Total blob migration time: ${blob_duration} seconds" >> $summary_log
+          else
+            echo "No containers to migrate" >> $summary_log
+          fi
+          
+          # Calculate and log final summary
+          total_end_time=$(date +%s)
+          total_duration=$((total_end_time - total_start_time))
+          
+          echo -e "\n=== Migration Summary ===" >> $summary_log
+          echo "Total migration time: ${total_duration} seconds" >> $summary_log
+          echo "Migration completed at $(date)" >> $summary_log
+          
+          # Print summary to console
+          cat $summary_log
+
+    - task: PublishBuildArtifacts@1
+      inputs:
+        pathToPublish: 'migration_logs'
+        artifactName: 'MigrationLogs'
+
+- stage: PostMigrationValidation
+  dependsOn: MigrateStorage
+  jobs:
+  - job: Validate
+    timeoutInMinutes: 60
+    pool:
+      name: 'iac-devops-pool'
+    steps:
+    - task: AzureCLI@2
+      name: ValidateMigration
+      inputs:
+        azureSubscription: ASDFGSUB
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          # Compare storage metrics
+          source_metrics=$(az storage account show-usage \
+            --location westeurope \
+            --account-name QWERTY \
+            --only-show-errors)
+          target_metrics=$(az storage account show-usage \
+            --location westeurope \
+            --account-name ASDFG \
+            --only-show-errors)
+          
+          echo "Source storage metrics: $source_metrics"
+          echo "Target storage metrics: $target_metrics"
+          
+          # Log migration summary
+          echo "Migration completed with time filter: ${{ parameters.modifiedSince }}"
