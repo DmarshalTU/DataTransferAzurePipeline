@@ -11,6 +11,12 @@ parameters:
   - name: batchSize
     type: number
     default: 50000
+  - name: retryAttempts
+    type: number
+    default: 3
+  - name: retryDelay
+    type: number
+    default: 30
 
   # Time filter
   - name: modifiedSince
@@ -30,6 +36,7 @@ variables:
   AZURE_STORAGE_AUTH_MODE: key
   AZURE_LOG_LEVEL: INFO
   AZCOPY_PRESERVE_PROPERTIES: true
+  # NOTIFICATION_WEBHOOK: "$(notificationWebhook)"
 
 stages:
 - stage: PreMigrationSetup
@@ -456,11 +463,6 @@ stages:
             echo "No tables to migrate" >> $summary_log
           fi
 
-    - task: PublishBuildArtifacts@1
-      inputs:
-        pathToPublish: 'migration_logs'
-        artifactName: 'MigrationLogs'
-
 - stage: PostMigrationValidation
   dependsOn: MigrateStorage
   jobs:
@@ -476,18 +478,153 @@ stages:
         scriptType: 'bash'
         scriptLocation: 'inlineScript'
         inlineScript: |
-          # Compare storage metrics
-          source_metrics=$(az storage account show-usage \
-            --location westeurope \
-            --account-name QWERTY \
-            --only-show-errors)
-          target_metrics=$(az storage account show-usage \
-            --location westeurope \
-            --account-name ASDFG \
-            --only-show-errors)
+          echo "Starting validation process..."
+          validation_log="migration_logs/validation_summary.log"
+          echo "Validation Summary - Started at $(date)" > $validation_log
           
-          echo "Source storage metrics: $source_metrics"
-          echo "Target storage metrics: $target_metrics"
+          # Function to get storage metrics
+          get_storage_metrics() {
+            local account_name=$1
+            local subscription=$2
+            
+            # Get basic storage account properties
+            local metrics=$(az storage account show \
+              --name $account_name \
+              --subscription $subscription \
+              --query "{
+                blobCount:primaryEndpoints.blob,
+                fileCount:primaryEndpoints.file,
+                tableCount:primaryEndpoints.table,
+                totalSize:properties.primaryEndpoints
+              }" -o json)
+            
+            echo $metrics
+          }
+
+          # Function to verify data integrity for a container
+          verify_container_integrity() {
+            local container=$1
+            local source_account=$2
+            local target_account=$3
+            local source_sas=$4
+            local target_sas=$5
+            
+            echo "Verifying integrity for container: $container"
+            
+            # Get blob list and MD5 hashes from source
+            source_blobs=$(az storage blob list \
+              --container-name "$container" \
+              --account-name "$source_account" \
+              --sas-token "$source_sas" \
+              --query "[].{name:name, hash:properties.contentMD5}" -o json)
+            
+            # Get blob list and MD5 hashes from target
+            target_blobs=$(az storage blob list \
+              --container-name "$container" \
+              --account-name "$target_account" \
+              --sas-token "$target_sas" \
+              --query "[].{name:name, hash:properties.contentMD5}" -o json)
+            
+            # Compare using jq
+            if [ "$(echo $source_blobs | jq -S .)" = "$(echo $target_blobs | jq -S .)" ]; then
+              echo "✓ Container $container integrity verified" >> $validation_log
+              return 0
+            else
+              echo "❌ Container $container integrity check failed" >> $validation_log
+              return 1
+            fi
+          }
+
+          # Function to retry failed transfers
+          retry_transfer() {
+            local source_url=$1
+            local target_url=$2
+            local max_retries=3
+            local retry_count=0
+            
+            while [ $retry_count -lt $max_retries ]; do
+              echo "Retry attempt $((retry_count + 1)) of $max_retries"
+              
+              azcopy copy \
+                "$source_url" \
+                "$target_url" \
+                --recursive \
+                --block-size-mb=${{ parameters.blockSize }} \
+                --cap-mbps=${{ parameters.concurrency }} \
+                --log-level=ERROR \
+                --output-type=text
+              
+              if [ $? -eq 0 ]; then
+                echo "✓ Retry successful"
+                return 0
+              fi
+              
+              retry_count=$((retry_count + 1))
+              sleep 30
+            done
+            
+            return 1
+          }
+
+          # Get metrics for both accounts
+          echo "Collecting storage metrics..."
+          source_metrics=$(get_storage_metrics "QWERTY" "QWERTYSUB")
+          target_metrics=$(get_storage_metrics "ASDFG" "ASDFGSUB")
           
-          # Log migration summary
-          echo "Migration completed with time filter: ${{ parameters.modifiedSince }}"
+          # Log metrics
+          echo "Source Account Metrics:" >> $validation_log
+          echo "$source_metrics" >> $validation_log
+          echo "Target Account Metrics:" >> $validation_log
+          echo "$target_metrics" >> $validation_log
+
+          # Verify data integrity
+          echo "Starting data integrity verification..."
+          failed_containers=()
+          
+          while IFS= read -r container; do
+            if ! verify_container_integrity "$container" "QWERTY" "ASDFG" "$(SOURCE_SAS)" "$(TARGET_SAS)"; then
+              failed_containers+=("$container")
+            fi
+          done < "migration_lists/containers.txt"
+
+          # Handle failed containers
+          if [ ${#failed_containers[@]} -gt 0 ]; then
+            echo "Failed containers detected. Starting retry process..."
+            for container in "${failed_containers[@]}"; do
+              echo "Retrying transfer for container: $container"
+              
+              source_url="https://QWERTY.blob.core.windows.net/${container}?$(SOURCE_SAS)"
+              target_url="https://ASDFG.blob.core.windows.net/${container}?$(TARGET_SAS)"
+              
+              if retry_transfer "$source_url" "$target_url"; then
+                echo "✓ Retry successful for container: $container" >> $validation_log
+              else
+                echo "❌ Final retry failed for container: $container" >> $validation_log
+                echo "##vso[task.logissue type=warning]Container $container failed all retry attempts"
+              fi
+            done
+          fi
+
+          # Send notification if configured
+          if [ -n "$NOTIFICATION_WEBHOOK" ]; then
+            curl -X POST -H "Content-Type: application/json" \
+              -d "{\"text\":\"Storage migration completed. Check validation logs for details.\"}" \
+              "$NOTIFICATION_WEBHOOK"
+          fi
+
+          # Final summary
+          echo -e "\n=== Validation Summary ===" >> $validation_log
+          echo "Total containers processed: $(wc -l < migration_lists/containers.txt)" >> $validation_log
+          echo "Failed containers: ${#failed_containers[@]}" >> $validation_log
+          echo "Validation completed at $(date)" >> $validation_log
+          
+          # Fail the pipeline if there are still failed containers
+          if [ ${#failed_containers[@]} -gt 0 ]; then
+            echo "##vso[task.complete result=Failed;]Some containers failed to migrate properly"
+            exit 1
+          fi
+
+    - task: PublishBuildArtifacts@1
+      inputs:
+        pathToPublish: 'migration_logs'
+        artifactName: 'ValidationLogs'
