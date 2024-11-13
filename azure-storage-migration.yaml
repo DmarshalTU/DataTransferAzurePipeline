@@ -335,6 +335,127 @@ stages:
           # Print summary to console
           cat $summary_log
 
+          # Process file shares
+          if [ -s "migration_lists/shares.txt" ]; then
+            echo "=== File Share Migration ===" >> $summary_log
+            share_start_time=$(date +%s)
+            
+            # Read shares into array
+            readarray -t SHARES < migration_lists/shares.txt
+            total_shares=${#SHARES[@]}
+            echo "Total file shares to process: $total_shares"
+            
+            # Process each share
+            for share in "${SHARES[@]}"; do
+              share_start_time=$(date +%s)
+              echo "Processing file share: $share"
+              
+              # Create share in target
+              az storage share create \
+                --name "$share" \
+                --account-name ASDFG \
+                --sas-token "$(TARGET_SAS)" \
+                --only-show-errors 2>&1 || true
+                
+              # Run azcopy for file share
+              (
+                azcopy copy \
+                  "https://QWERTY.file.core.windows.net/${share}?$(SOURCE_SAS)" \
+                  "https://ASDFG.file.core.windows.net/${share}?$(TARGET_SAS)" \
+                  --recursive \
+                  --block-size-mb=${{ parameters.blockSize }} \
+                  --cap-mbps=${{ parameters.concurrency }} \
+                  --include-after "$(CUTOFF_DATE)" \
+                  --log-level=ERROR \
+                  --output-type=text
+              ) &
+              
+              # Store PID of background process
+              azcopy_pid=$!
+              
+              # Wait for azcopy to complete
+              wait $azcopy_pid || true
+              
+              share_end_time=$(date +%s)
+              share_duration=$((share_end_time - share_start_time))
+              echo "✓ File share $share completed in ${share_duration} seconds" >> $summary_log
+              echo "✓ Completed file share $share (${share_duration}s)"
+              
+              # Force continue
+              set +e
+              true
+            done
+            
+            share_end_time=$(date +%s)
+            share_duration=$((share_end_time - share_start_time))
+            echo "Total file share migration time: ${share_duration} seconds" >> $summary_log
+          else
+            echo "No file shares to migrate" >> $summary_log
+          fi
+
+          # Process tables
+          if [ -s "migration_lists/tables.txt" ]; then
+            echo "=== Table Migration ===" >> $summary_log
+            table_start_time=$(date +%s)
+            
+            # List tables
+            az storage table list \
+              --account-name QWERTY \
+              --sas-token "$(SOURCE_SAS)" \
+              --query "[].name" -o tsv > "migration_lists/tables.txt"
+            
+            # Read tables into array
+            readarray -t TABLES < migration_lists/tables.txt
+            total_tables=${#TABLES[@]}
+            echo "Total tables to process: $total_tables"
+            
+            # Process each table
+            for table in "${TABLES[@]}"; do
+              table_start_time=$(date +%s)
+              echo "Processing table: $table"
+              
+              # Create table in target
+              az storage table create \
+                --name "$table" \
+                --account-name ASDFG \
+                --sas-token "$(TARGET_SAS)" \
+                --only-show-errors 2>&1 || true
+                
+              # Run azcopy for table
+              (
+                azcopy copy \
+                  "https://QWERTY.table.core.windows.net/${table}?$(SOURCE_SAS)" \
+                  "https://ASDFG.table.core.windows.net/${table}?$(TARGET_SAS)" \
+                  --recursive \
+                  --block-size-mb=${{ parameters.blockSize }} \
+                  --cap-mbps=${{ parameters.concurrency }} \
+                  --log-level=ERROR \
+                  --output-type=text
+              ) &
+              
+              # Store PID of background process
+              azcopy_pid=$!
+              
+              # Wait for azcopy to complete
+              wait $azcopy_pid || true
+              
+              table_end_time=$(date +%s)
+              table_duration=$((table_end_time - table_start_time))
+              echo "✓ Table $table completed in ${table_duration} seconds" >> $summary_log
+              echo "✓ Completed table $table (${table_duration}s)"
+              
+              # Force continue
+              set +e
+              true
+            done
+            
+            table_end_time=$(date +%s)
+            table_duration=$((table_end_time - table_start_time))
+            echo "Total table migration time: ${table_duration} seconds" >> $summary_log
+          else
+            echo "No tables to migrate" >> $summary_log
+          fi
+
     - task: PublishBuildArtifacts@1
       inputs:
         pathToPublish: 'migration_logs'
