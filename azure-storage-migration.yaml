@@ -31,10 +31,12 @@ parameters:
       - 'all'
 
 variables:
-  SOURCE_ACCOUNT: QWERTY
-  TARGET_ACCOUNT: ASDFG
+  # SOURCE_ACCOUNT: $(SOURCE_ACCOUNT)
+  # TARGET_ACCOUNT: $(TARGET_ACCOUNT)
+  # SOURCE_SUB: $(SOURCE_SUB)
+  # TARGET_SUB: $(TARGET_SUB)
   AZURE_STORAGE_AUTH_MODE: key
-  AZURE_LOG_LEVEL: INFO
+  AZURE_LOG_LEVEL: ERROR
   AZCOPY_PRESERVE_PROPERTIES: true
   # NOTIFICATION_WEBHOOK: "$(notificationWebhook)"
 
@@ -49,14 +51,14 @@ stages:
     - task: AzureCLI@2
       name: ConfigureStorageNetworking
       inputs:
-        azureSubscription: ASDFGSUB
+        azureSubscription: '$(TARGET_SUB)'
         scriptType: 'bash'
         scriptLocation: 'inlineScript'
         inlineScript: |
           # Enable private endpoints for target storage
           az storage account update \
             --only-show-errors \
-            --name ASDFG \
+            --name "$(TARGET_ACCOUNT)" \
             --allow-shared-key-access true \
             --default-action Deny \
             --bypass AzureServices \
@@ -65,7 +67,7 @@ stages:
           # Configure storage account for maximum throughput
           az storage account update \
             --only-show-errors \
-            --name ASDFG \
+            --name "$(TARGET_ACCOUNT)" \
             --routing-choice InternetRouting \
             --publish-internet-endpoints false \
             --publish-microsoft-endpoints true \
@@ -84,7 +86,7 @@ stages:
     - task: AzureCLI@2
       name: GenerateSourceSAS
       inputs:
-        azureSubscription: QWERTYSUB
+        azureSubscription: '$(SOURCE_SUB)'
         scriptType: 'bash'
         scriptLocation: 'inlineScript'
         inlineScript: |
@@ -106,7 +108,7 @@ stages:
           # Generate SAS token for source with read access
           source_sas=$(az storage account generate-sas \
             --permissions rlf \
-            --account-name QWERTY \
+            --account-name "$(SOURCE_ACCOUNT)" \
             --services bft \
             --resource-types sco \
             --expiry "$(date -u -d "7 days" '+%Y-%m-%dT%H:%MZ')" \
@@ -117,7 +119,7 @@ stages:
           
           # Verify SAS token works
           if ! az storage container list \
-            --account-name QWERTY \
+            --account-name "$(SOURCE_ACCOUNT)" \
             --sas-token "$source_sas" \
             --only-show-errors; then
             echo "Error: Source SAS token verification failed"
@@ -128,14 +130,14 @@ stages:
     - task: AzureCLI@2
       name: GenerateTargetSAS
       inputs:
-        azureSubscription: ASDFGSUB
+        azureSubscription: '$(TARGET_SUB)'
         scriptType: 'bash'
         scriptLocation: 'inlineScript'
         inlineScript: |
           # Generate SAS token for target with full access
           target_sas=$(az storage account generate-sas \
             --permissions rwdlacup \
-            --account-name ASDFG \
+            --account-name "$(TARGET_ACCOUNT)" \
             --services bft \
             --resource-types sco \
             --expiry "$(date -u -d "7 days" '+%Y-%m-%dT%H:%MZ')" \
@@ -147,7 +149,7 @@ stages:
           # Verify SAS token works
           if ! az storage container create \
             --name "pipeline-check-container-t1" \
-            --account-name ASDFG \
+            --account-name "$(TARGET_ACCOUNT)" \
             --sas-token "$target_sas" \
             --only-show-errors; then
             echo "Error: Target SAS token feild"
@@ -164,7 +166,7 @@ stages:
           # Cleanup
           az storage container delete\
             --name "pipeline-check-container-t1" \
-            --account-name ASDFG \
+            --account-name "$(TARGET_ACCOUNT)" \
             --sas-token "$target_sas" \
             --only-show-errors
             
@@ -173,7 +175,7 @@ stages:
     - task: AzureCLI@2
       name: SourceTargetVerification
       inputs:
-        azureSubscription: QWERTYSUB
+        azureSubscription: '$(SOURCE_SUB)'
         scriptType: 'bash'
         scriptLocation: 'inlineScript'
         inlineScript: |
@@ -182,7 +184,7 @@ stages:
           # Verify target SAS token works
           if ! az storage container create \
             --name "pipeline-check-container-t2" \
-            --account-name ASDFG \
+            --account-name "$(TARGET_ACCOUNT)" \
             --sas-token "$(TARGET_SAS)" \
             --only-show-errors; then
             echo "Error: Target SAS token feild"
@@ -199,7 +201,7 @@ stages:
           # Cleanup
           az storage container delete\
             --name "pipeline-check-container-t2" \
-            --account-name ASDFG \
+            --account-name "$(TARGET_ACCOUNT)" \
             --sas-token "$(TARGET_SAS)" \
             --only-show-errors
           
@@ -208,7 +210,7 @@ stages:
     - task: AzureCLI@2
       name: PrepareSourceData
       inputs:
-        azureSubscription: QWERTYSUB
+        azureSubscription: '$(SOURCE_SUB)'
         scriptType: 'bash'
         scriptLocation: 'inlineScript'
         inlineScript: |
@@ -220,13 +222,13 @@ stages:
             case $type in
               "containers")
                 az storage container list \
-                  --account-name QWERTY \
+                  --account-name "$(SOURCE_ACCOUNT)" \
                   --sas-token "$(SOURCE_SAS)" \
                   --query "[].name" -o tsv > "migration_lists/${type}.txt"
                 ;;
               "shares")
                 az storage share list \
-                  --account-name QWERTY \
+                  --account-name "$(SOURCE_ACCOUNT)" \
                   --sas-token "$(SOURCE_SAS)" \
                   --query "[].name" -o tsv > "migration_lists/${type}.txt"
                 ;;
@@ -248,7 +250,7 @@ stages:
     - task: AzureCLI@2
       name: PerformMigration
       inputs:
-        azureSubscription: QWERTYSUB
+        azureSubscription: '$(SOURCE_SUB)'
         scriptType: 'bash'
         scriptLocation: 'inlineScript'
         inlineScript: |
@@ -275,7 +277,7 @@ stages:
               if [ -n "$(CUTOFF_DATE)" ]; then
                 matching_blobs=$(az storage blob list \
                   --container-name "$container" \
-                  --account-name QWERTY \
+                  --account-name "$(SOURCE_ACCOUNT)" \
                   --sas-token "$(SOURCE_SAS)" \
                   --query "[?properties.lastModified >= '${CUTOFF_DATE}'].name" \
                   --only-show-errors -o tsv 2>&1 || echo "")
@@ -290,15 +292,15 @@ stages:
               # Create container in target
               az storage container create \
                 --name "$container" \
-                --account-name ASDFG \
+                --account-name "$(TARGET_ACCOUNT)" \
                 --sas-token "$(TARGET_SAS)" \
                 --only-show-errors 2>&1 || true
                 
               # Run azcopy in background and wait
               (
                 azcopy copy \
-                  "https://QWERTY.blob.core.windows.net/${container}?$(SOURCE_SAS)" \
-                  "https://ASDFG.blob.core.windows.net/${container}?$(TARGET_SAS)" \
+                  "https://$(SOURCE_ACCOUNT).blob.core.windows.net/${container}?$(SOURCE_SAS)" \
+                  "https://$(TARGET_ACCOUNT).blob.core.windows.net/${container}?$(TARGET_SAS)" \
                   --recursive \
                   --block-size-mb=${{ parameters.blockSize }} \
                   --cap-mbps=${{ parameters.concurrency }} \
@@ -360,15 +362,15 @@ stages:
               # Create share in target
               az storage share create \
                 --name "$share" \
-                --account-name ASDFG \
+                --account-name "$(TARGET_ACCOUNT)" \
                 --sas-token "$(TARGET_SAS)" \
                 --only-show-errors 2>&1 || true
                 
               # Run azcopy for file share
               (
                 azcopy copy \
-                  "https://QWERTY.file.core.windows.net/${share}?$(SOURCE_SAS)" \
-                  "https://ASDFG.file.core.windows.net/${share}?$(TARGET_SAS)" \
+                  "https://$(SOURCE_ACCOUNT).file.core.windows.net/${share}?$(SOURCE_SAS)" \
+                  "https://$(TARGET_ACCOUNT).file.core.windows.net/${share}?$(TARGET_SAS)" \
                   --recursive \
                   --block-size-mb=${{ parameters.blockSize }} \
                   --cap-mbps=${{ parameters.concurrency }} \
@@ -407,7 +409,7 @@ stages:
             
             # List tables
             az storage table list \
-              --account-name QWERTY \
+              --account-name "$(SOURCE_ACCOUNT)" \
               --sas-token "$(SOURCE_SAS)" \
               --query "[].name" -o tsv > "migration_lists/tables.txt"
             
@@ -424,15 +426,15 @@ stages:
               # Create table in target
               az storage table create \
                 --name "$table" \
-                --account-name ASDFG \
+                --account-name "$(TARGET_ACCOUNT)" \
                 --sas-token "$(TARGET_SAS)" \
                 --only-show-errors 2>&1 || true
                 
               # Run azcopy for table
               (
                 azcopy copy \
-                  "https://QWERTY.table.core.windows.net/${table}?$(SOURCE_SAS)" \
-                  "https://ASDFG.table.core.windows.net/${table}?$(TARGET_SAS)" \
+                  "https://$(SOURCE_ACCOUNT).table.core.windows.net/${table}?$(SOURCE_SAS)" \
+                  "https://$(TARGET_ACCOUNT).table.core.windows.net/${table}?$(TARGET_SAS)" \
                   --recursive \
                   --block-size-mb=${{ parameters.blockSize }} \
                   --cap-mbps=${{ parameters.concurrency }} \
@@ -462,19 +464,23 @@ stages:
           else
             echo "No tables to migrate" >> $summary_log
           fi
+    - task: PublishBuildArtifacts@1
+      inputs:
+        pathToPublish: 'migration_logs'
+        artifactName: 'MigrationLogs'
 
-- stage: PostMigrationValidation
-  dependsOn: MigrateStorage
-  jobs:
-  - job: Validate
-    timeoutInMinutes: 60
-    pool:
-      name: 'iac-devops-pool'
-    steps:
+# - stage: PostMigrationValidation
+#   dependsOn: MigrateStorage
+#   jobs:
+#   - job: Validate
+#     timeoutInMinutes: 60
+#     pool:
+#       name: 'iac-devops-pool'
+#     steps:
     - task: AzureCLI@2
       name: ValidateMigration
       inputs:
-        azureSubscription: ASDFGSUB
+        azureSubscription: '$(TARGET_SUB)'
         scriptType: 'bash'
         scriptLocation: 'inlineScript'
         inlineScript: |
@@ -568,8 +574,8 @@ stages:
 
           # Get metrics for both accounts
           echo "Collecting storage metrics..."
-          source_metrics=$(get_storage_metrics "QWERTY" "QWERTYSUB")
-          target_metrics=$(get_storage_metrics "ASDFG" "ASDFGSUB")
+          source_metrics=$(get_storage_metrics "$(SOURCE_ACCOUNT)" "XXXXXXXXXXXX111111111111XXXXXXXXXXXXXXX")
+          target_metrics=$(get_storage_metrics "$(TARGET_ACCOUNT)" "WWWWWWWWWWWWWWWWWWWWWWWW222222222222222222WWWWWWWWWWWWW")
           
           # Log metrics
           echo "Source Account Metrics:" >> $validation_log
@@ -582,7 +588,7 @@ stages:
           failed_containers=()
           
           while IFS= read -r container; do
-            if ! verify_container_integrity "$container" "QWERTY" "ASDFG" "$(SOURCE_SAS)" "$(TARGET_SAS)"; then
+            if ! verify_container_integrity "$container" "$(SOURCE_ACCOUNT)" "$(TARGET_ACCOUNT)" "$(SOURCE_SAS)" "$(TARGET_SAS)"; then
               failed_containers+=("$container")
             fi
           done < "migration_lists/containers.txt"
@@ -593,8 +599,8 @@ stages:
             for container in "${failed_containers[@]}"; do
               echo "Retrying transfer for container: $container"
               
-              source_url="https://QWERTY.blob.core.windows.net/${container}?$(SOURCE_SAS)"
-              target_url="https://ASDFG.blob.core.windows.net/${container}?$(TARGET_SAS)"
+              source_url="https://"$(SOURCE_ACCOUNT)".blob.core.windows.net/${container}?$(SOURCE_SAS)"
+              target_url="https://"$(TARGET_ACCOUNT)".blob.core.windows.net/${container}?$(TARGET_SAS)"
               
               if retry_transfer "$source_url" "$target_url"; then
                 echo "✓ Retry successful for container: $container" >> $validation_log
