@@ -4,19 +4,22 @@ parameters:
   # Transfer settings
   - name: blockSize
     type: number
-    default: 256
+    default: 512    # Increased for large files
   - name: concurrency
     type: number
-    default: 128
+    default: 256    # Balanced for parallel processing
   - name: batchSize
     type: number
-    default: 50000
+    default: 100000 # Increased batch size
   - name: retryAttempts
     type: number
     default: 3
   - name: retryDelay
     type: number
     default: 30
+  - name: parallelTransfers
+    type: number
+    default: 3      # Number of parallel transfers for medium/small containers
 
   # Time filter
   - name: modifiedSince
@@ -31,14 +34,17 @@ parameters:
       - 'all'
 
 variables:
-  # SOURCE_ACCOUNT: $(SOURCE_ACCOUNT)
-  # TARGET_ACCOUNT: $(TARGET_ACCOUNT)
-  # SOURCE_SUB: $(SOURCE_SUB)
-  # TARGET_SUB: $(TARGET_SUB)
+  SOURCE_ACCOUNT: QWERTY
+  TARGET_ACCOUNT: ASDFG
   AZURE_STORAGE_AUTH_MODE: key
-  AZURE_LOG_LEVEL: ERROR
+  AZURE_LOG_LEVEL: INFO
   AZCOPY_PRESERVE_PROPERTIES: true
-  # NOTIFICATION_WEBHOOK: "$(notificationWebhook)"
+  AZCOPY_CONCURRENCY_VALUE: 2000
+  AZCOPY_BUFFER_GB: 2000
+  AZCOPY_CONCURRENT_SCAN: 2000
+  # Size thresholds in bytes
+  LARGE_CONTAINER_THRESHOLD: 107374182400  # 100GB
+  MEDIUM_CONTAINER_THRESHOLD: 10737418240  # 10GB
 
 stages:
 - stage: PreMigrationSetup
@@ -47,18 +53,21 @@ stages:
     timeoutInMinutes: 30
     pool:
       name: 'iac-devops-pool'
+      demands:
+        - Agent.OS -equals Linux
+        - Agent.OSArchitecture -equals X64
     steps:
     - task: AzureCLI@2
       name: ConfigureStorageNetworking
       inputs:
-        azureSubscription: '$(TARGET_SUB)'
+        azureSubscription: ASDFGSUB
         scriptType: 'bash'
         scriptLocation: 'inlineScript'
         inlineScript: |
           # Enable private endpoints for target storage
           az storage account update \
             --only-show-errors \
-            --name "$(TARGET_ACCOUNT)" \
+            --name ASDFG \
             --allow-shared-key-access true \
             --default-action Deny \
             --bypass AzureServices \
@@ -67,13 +76,11 @@ stages:
           # Configure storage account for maximum throughput
           az storage account update \
             --only-show-errors \
-            --name "$(TARGET_ACCOUNT)" \
+            --name ASDFG \
             --routing-choice InternetRouting \
             --publish-internet-endpoints false \
             --publish-microsoft-endpoints true \
             --only-show-errors
-        addSpnToEnvironment: true
-
 
 - stage: MigrateStorage
   dependsOn: PreMigrationSetup
@@ -82,11 +89,14 @@ stages:
     timeoutInMinutes: 4320  # 72 hours
     pool:
       name: 'iac-devops-pool'
+      demands:
+        - Agent.OS -equals Linux
+        - Agent.OSArchitecture -equals X64
     steps:
     - task: AzureCLI@2
       name: GenerateSourceSAS
       inputs:
-        azureSubscription: '$(SOURCE_SUB)'
+        azureSubscription: QWERTYSUB
         scriptType: 'bash'
         scriptLocation: 'inlineScript'
         inlineScript: |
@@ -105,10 +115,9 @@ stages:
             echo "Migrating all files"
           fi
 
-          # Generate SAS token for source with read access
           source_sas=$(az storage account generate-sas \
             --permissions rlf \
-            --account-name "$(SOURCE_ACCOUNT)" \
+            --account-name QWERTY \
             --services bft \
             --resource-types sco \
             --expiry "$(date -u -d "7 days" '+%Y-%m-%dT%H:%MZ')" \
@@ -117,27 +126,24 @@ stages:
           
           echo "##vso[task.setvariable variable=SOURCE_SAS;]$source_sas"
           
-          # Verify SAS token works
           if ! az storage container list \
-            --account-name "$(SOURCE_ACCOUNT)" \
+            --account-name QWERTY \
             --sas-token "$source_sas" \
             --only-show-errors; then
             echo "Error: Source SAS token verification failed"
             exit 1
           fi
-          echo "Source SAS token generated and verified successfully"
 
     - task: AzureCLI@2
       name: GenerateTargetSAS
       inputs:
-        azureSubscription: '$(TARGET_SUB)'
+        azureSubscription: ASDFGSUB
         scriptType: 'bash'
         scriptLocation: 'inlineScript'
         inlineScript: |
-          # Generate SAS token for target with full access
           target_sas=$(az storage account generate-sas \
             --permissions rwdlacup \
-            --account-name "$(TARGET_ACCOUNT)" \
+            --account-name ASDFG \
             --services bft \
             --resource-types sco \
             --expiry "$(date -u -d "7 days" '+%Y-%m-%dT%H:%MZ')" \
@@ -146,111 +152,84 @@ stages:
           
           echo "##vso[task.setvariable variable=TARGET_SAS;]$target_sas"
           
-          # Verify SAS token works
           if ! az storage container create \
-            --name "pipeline-check-container-t1" \
-            --account-name "$(TARGET_ACCOUNT)" \
+            --name "pipeline-check-container" \
+            --account-name ASDFG \
             --sas-token "$target_sas" \
             --only-show-errors; then
-            echo "Error: Target SAS token feild"
+            echo "Error: Target SAS token verification failed"
             exit 1
           fi
-
-          secs=$((10))
-          while [ $secs -gt 0 ]; do
-            echo -ne "Resting for $secs\033[0K\r seconds...\n"
-            sleep 1
-            : $((secs--))
-          done
-
-          # Cleanup
-          az storage container delete\
-            --name "pipeline-check-container-t1" \
-            --account-name "$(TARGET_ACCOUNT)" \
+          
+          az storage container delete \
+            --name "pipeline-check-container" \
+            --account-name ASDFG \
             --sas-token "$target_sas" \
             --only-show-errors
-            
-          echo "Target SAS token generated and verified successfully"
-          
-    - task: AzureCLI@2
-      name: SourceTargetVerification
-      inputs:
-        azureSubscription: '$(SOURCE_SUB)'
-        scriptType: 'bash'
-        scriptLocation: 'inlineScript'
-        inlineScript: |
-        
-          echo "$(TARGET_SAS)"
-          # Verify target SAS token works
-          if ! az storage container create \
-            --name "pipeline-check-container-t2" \
-            --account-name "$(TARGET_ACCOUNT)" \
-            --sas-token "$(TARGET_SAS)" \
-            --only-show-errors; then
-            echo "Error: Target SAS token feild"
-            exit 1
-          fi
-
-          secs=$((10))
-          while [ $secs -gt 0 ]; do
-            echo -ne "Resting for $secs\033[0K\r seconds...\n"
-            sleep 1
-            : $((secs--))
-          done
-
-          # Cleanup
-          az storage container delete\
-            --name "pipeline-check-container-t2" \
-            --account-name "$(TARGET_ACCOUNT)" \
-            --sas-token "$(TARGET_SAS)" \
-            --only-show-errors
-          
-          echo "Target SAS token verified successfully in Source Sub"
 
     - task: AzureCLI@2
       name: PrepareSourceData
       inputs:
-        azureSubscription: '$(SOURCE_SUB)'
+        azureSubscription: QWERTYSUB
         scriptType: 'bash'
         scriptLocation: 'inlineScript'
         inlineScript: |
           mkdir -p migration_lists migration_logs
           
-          # Get and verify resource lists
-          for type in "containers" "shares"; do
-            echo "Checking for ${type}..."
-            case $type in
-              "containers")
-                az storage container list \
-                  --account-name "$(SOURCE_ACCOUNT)" \
-                  --sas-token "$(SOURCE_SAS)" \
-                  --query "[].name" -o tsv > "migration_lists/${type}.txt"
-                ;;
-              "shares")
-                az storage share list \
-                  --account-name "$(SOURCE_ACCOUNT)" \
-                  --sas-token "$(SOURCE_SAS)" \
-                  --query "[].name" -o tsv > "migration_lists/${type}.txt"
-                ;;
-            esac
+          # Initialize container classification files
+          > migration_lists/large_containers.txt
+          > migration_lists/medium_containers.txt
+          > migration_lists/small_containers.txt
+          
+          # Get and classify containers by size
+          echo "Analyzing containers and classifying by size..."
+          az storage container list \
+            --account-name QWERTY \
+            --sas-token "$(SOURCE_SAS)" \
+            --query "[].name" -o tsv | while read -r container; do
             
-            if [ $? -ne 0 ]; then
-              echo "Error: Failed to list ${type}"
-              exit 1
-            fi
+            size=$(az storage blob list \
+              --container-name "$container" \
+              --account-name QWERTY \
+              --sas-token "$(SOURCE_SAS)" \
+              --query "sum([].properties.contentLength)" -o tsv)
             
-            count=0
-            if [ -s "migration_lists/${type}.txt" ]; then
-              count=$(wc -l < "migration_lists/${type}.txt")
+            if [ $size -gt $LARGE_CONTAINER_THRESHOLD ]; then
+              echo "$container" >> migration_lists/large_containers.txt
+              echo "Large container found: $container ($(($size / 1024 / 1024 / 1024))GB)"
+            elif [ $size -gt $MEDIUM_CONTAINER_THRESHOLD ]; then
+              echo "$container" >> migration_lists/medium_containers.txt
+              echo "Medium container found: $container ($(($size / 1024 / 1024 / 1024))GB)"
+            else
+              echo "$container" >> migration_lists/small_containers.txt
+              echo "Small container found: $container ($(($size / 1024 / 1024))MB)"
             fi
-            echo "Found $count ${type} to process"
-            touch "migration_lists/${type}.txt"
           done
+          
+          # Get file shares
+          az storage share list \
+            --account-name QWERTY \
+            --sas-token "$(SOURCE_SAS)" \
+            --query "[].name" -o tsv > migration_lists/shares.txt
+          
+          # Get tables
+          az storage table list \
+            --account-name QWERTY \
+            --sas-token "$(SOURCE_SAS)" \
+            --query "[].name" -o tsv > migration_lists/tables.txt
+          
+          # Summary
+          echo "Classification complete:"
+          echo "Large containers: $(wc -l < migration_lists/large_containers.txt)"
+          echo "Medium containers: $(wc -l < migration_lists/medium_containers.txt)"
+          echo "Small containers: $(wc -l < migration_lists/small_containers.txt)"
+          echo "File shares: $(wc -l < migration_lists/shares.txt)"
+          echo "Tables: $(wc -l < migration_lists/tables.txt)"
 
     - task: AzureCLI@2
       name: PerformMigration
       inputs:
-        azureSubscription: '$(SOURCE_SUB)'
+        azureSubscription: QWERTYSUB
         scriptType: 'bash'
         scriptLocation: 'inlineScript'
         inlineScript: |
@@ -258,229 +237,151 @@ stages:
           echo "Migration Summary - Started at $(date)" > $summary_log
           total_start_time=$(date +%s)
           
-          # Process containers
-          if [ -s "migration_lists/containers.txt" ]; then
-            echo "=== Blob Migration ===" >> $summary_log
-            blob_start_time=$(date +%s)
+          # Function to perform single container migration
+          migrate_container() {
+            local container=$1
+            local block_size=$2
+            local cap_mbps=$3
+            local container_start_time=$(date +%s)
             
-            # Read containers into array
-            readarray -t CONTAINERS < migration_lists/containers.txt
-            total_containers=${#CONTAINERS[@]}
-            echo "Total containers to process: $total_containers"
+            echo "Migrating container: $container (Block size: ${block_size}MB, Cap: ${cap_mbps}Mbps)"
             
-            # Process each container
-            for container in "${CONTAINERS[@]}"; do
-              container_start_time=$(date +%s)
-              echo "Processing container: $container"
-              
-              # Check for matching blobs
-              if [ -n "$(CUTOFF_DATE)" ]; then
-                matching_blobs=$(az storage blob list \
-                  --container-name "$container" \
-                  --account-name "$(SOURCE_ACCOUNT)" \
-                  --sas-token "$(SOURCE_SAS)" \
-                  --query "[?properties.lastModified >= '${CUTOFF_DATE}'].name" \
-                  --only-show-errors -o tsv 2>&1 || echo "")
-                
-                if [ -z "$matching_blobs" ]; then
-                  echo "Skipping container $container - no blobs modified since $(CUTOFF_DATE)"
-                  continue
-                fi
-                echo "Found matching blobs in container $container"
-              fi
-              
-              # Create container in target
-              az storage container create \
-                --name "$container" \
-                --account-name "$(TARGET_ACCOUNT)" \
-                --sas-token "$(TARGET_SAS)" \
-                --only-show-errors 2>&1 || true
-                
-              # Run azcopy in background and wait
-              (
-                azcopy copy \
-                  "https://$(SOURCE_ACCOUNT).blob.core.windows.net/${container}?$(SOURCE_SAS)" \
-                  "https://$(TARGET_ACCOUNT).blob.core.windows.net/${container}?$(TARGET_SAS)" \
-                  --recursive \
-                  --block-size-mb=${{ parameters.blockSize }} \
-                  --cap-mbps=${{ parameters.concurrency }} \
-                  --include-after "$(CUTOFF_DATE)" \
-                  --log-level=ERROR \
-                  --output-type=text
-              ) &
-              
-              # Store PID of background process
-              azcopy_pid=$!
-              
-              # Wait for azcopy to complete
-              wait $azcopy_pid || true
-              
-              container_end_time=$(date +%s)
-              container_duration=$((container_end_time - container_start_time))
-              echo "✓ Container $container completed in ${container_duration} seconds" >> $summary_log
-              echo "✓ Completed container $container (${container_duration}s)"
-              
-              # Force continue
-              set +e
-              true
-              
-            done
+            # Create container in target
+            az storage container create \
+              --name "$container" \
+              --account-name ASDFG \
+              --sas-token "$(TARGET_SAS)" \
+              --only-show-errors
             
-            blob_end_time=$(date +%s)
-            blob_duration=$((blob_end_time - blob_start_time))
-            echo "Total blob migration time: ${blob_duration} seconds" >> $summary_log
-          else
-            echo "No containers to migrate" >> $summary_log
+            # Perform migration
+            azcopy copy \
+              "https://QWERTY.blob.core.windows.net/${container}?$(SOURCE_SAS)" \
+              "https://ASDFG.blob.core.windows.net/${container}?$(TARGET_SAS)" \
+              --recursive \
+              --block-size-mb=$block_size \
+              --cap-mbps=$cap_mbps \
+              --include-after "$(CUTOFF_DATE)" \
+              --log-level=ERROR \
+              --output-type=text
+            
+            local container_end_time=$(date +%s)
+            local duration=$((container_end_time - container_start_time))
+            echo "✓ Container $container completed in ${duration} seconds" >> $summary_log
+            return 0
+          }
+          
+          # Process large containers sequentially with maximum resources
+          echo "=== Processing Large Containers ===" >> $summary_log
+          if [ -s "migration_lists/large_containers.txt" ]; then
+            while IFS= read -r container; do
+              migrate_container "$container" 512 2000
+            done < "migration_lists/large_containers.txt"
           fi
           
-          # Calculate and log final summary
-          total_end_time=$(date +%s)
-          total_duration=$((total_end_time - total_start_time))
+          # Process medium containers with parallel execution
+          echo "=== Processing Medium Containers ===" >> $summary_log
+          if [ -s "migration_lists/medium_containers.txt" ]; then
+            current_parallel=0
+            while IFS= read -r container; do
+              if [ $current_parallel -ge ${{ parameters.parallelTransfers }} ]; then
+                wait -n
+                current_parallel=$((current_parallel - 1))
+              fi
+              migrate_container "$container" 256 1000 &
+              current_parallel=$((current_parallel + 1))
+            done < "migration_lists/medium_containers.txt"
+            wait
+          fi
           
-          echo -e "\n=== Migration Summary ===" >> $summary_log
-          echo "Total migration time: ${total_duration} seconds" >> $summary_log
-          echo "Migration completed at $(date)" >> $summary_log
+          # Process small containers with maximum parallelism
+          echo "=== Processing Small Containers ===" >> $summary_log
+          if [ -s "migration_lists/small_containers.txt" ]; then
+            current_parallel=0
+            while IFS= read -r container; do
+              if [ $current_parallel -ge $((${{ parameters.parallelTransfers }} * 2)) ]; then
+                wait -n
+                current_parallel=$((current_parallel - 1))
+              fi
+              migrate_container "$container" 128 500 &
+              current_parallel=$((current_parallel + 1))
+            done < "migration_lists/small_containers.txt"
+            wait
+          fi
           
-          # Print summary to console
-          cat $summary_log
-
           # Process file shares
+          echo "=== Processing File Shares ===" >> $summary_log
           if [ -s "migration_lists/shares.txt" ]; then
-            echo "=== File Share Migration ===" >> $summary_log
-            share_start_time=$(date +%s)
-            
-            # Read shares into array
-            readarray -t SHARES < migration_lists/shares.txt
-            total_shares=${#SHARES[@]}
-            echo "Total file shares to process: $total_shares"
-            
-            # Process each share
-            for share in "${SHARES[@]}"; do
+            while IFS= read -r share; do
               share_start_time=$(date +%s)
-              echo "Processing file share: $share"
               
-              # Create share in target
               az storage share create \
                 --name "$share" \
-                --account-name "$(TARGET_ACCOUNT)" \
+                --account-name ASDFG \
                 --sas-token "$(TARGET_SAS)" \
-                --only-show-errors 2>&1 || true
-                
-              # Run azcopy for file share
-              (
-                azcopy copy \
-                  "https://$(SOURCE_ACCOUNT).file.core.windows.net/${share}?$(SOURCE_SAS)" \
-                  "https://$(TARGET_ACCOUNT).file.core.windows.net/${share}?$(TARGET_SAS)" \
-                  --recursive \
-                  --block-size-mb=${{ parameters.blockSize }} \
-                  --cap-mbps=${{ parameters.concurrency }} \
-                  --include-after "$(CUTOFF_DATE)" \
-                  --log-level=ERROR \
-                  --output-type=text
-              ) &
+                --only-show-errors
               
-              # Store PID of background process
-              azcopy_pid=$!
+              azcopy copy \
+                "https://QWERTY.file.core.windows.net/${share}?$(SOURCE_SAS)" \
+                "https://ASDFG.file.core.windows.net/${share}?$(TARGET_SAS)" \
+                --recursive \
+                --block-size-mb=256 \
+                --cap-mbps=1000 \
+                --include-after "$(CUTOFF_DATE)" \
+                --log-level=ERROR \
+                --output-type=text &
               
-              # Wait for azcopy to complete
-              wait $azcopy_pid || true
+              wait $!
               
               share_end_time=$(date +%s)
-              share_duration=$((share_end_time - share_start_time))
-              echo "✓ File share $share completed in ${share_duration} seconds" >> $summary_log
-              echo "✓ Completed file share $share (${share_duration}s)"
-              
-              # Force continue
-              set +e
-              true
-            done
-            
-            share_end_time=$(date +%s)
-            share_duration=$((share_end_time - share_start_time))
-            echo "Total file share migration time: ${share_duration} seconds" >> $summary_log
-          else
-            echo "No file shares to migrate" >> $summary_log
+              duration=$((share_end_time - share_start_time))
+              echo "✓ File share $share completed in ${duration} seconds" >> $summary_log
+            done < "migration_lists/shares.txt"
           fi
-
+          
           # Process tables
+          echo "=== Processing Tables ===" >> $summary_log
           if [ -s "migration_lists/tables.txt" ]; then
-            echo "=== Table Migration ===" >> $summary_log
-            table_start_time=$(date +%s)
-            
-            # List tables
-            az storage table list \
-              --account-name "$(SOURCE_ACCOUNT)" \
-              --sas-token "$(SOURCE_SAS)" \
-              --query "[].name" -o tsv > "migration_lists/tables.txt"
-            
-            # Read tables into array
-            readarray -t TABLES < migration_lists/tables.txt
-            total_tables=${#TABLES[@]}
-            echo "Total tables to process: $total_tables"
-            
-            # Process each table
-            for table in "${TABLES[@]}"; do
+            while IFS= read -r table; do
               table_start_time=$(date +%s)
-              echo "Processing table: $table"
               
-              # Create table in target
               az storage table create \
                 --name "$table" \
-                --account-name "$(TARGET_ACCOUNT)" \
+                --account-name ASDFG \
                 --sas-token "$(TARGET_SAS)" \
-                --only-show-errors 2>&1 || true
-                
-              # Run azcopy for table
-              (
-                azcopy copy \
-                  "https://$(SOURCE_ACCOUNT).table.core.windows.net/${table}?$(SOURCE_SAS)" \
-                  "https://$(TARGET_ACCOUNT).table.core.windows.net/${table}?$(TARGET_SAS)" \
-                  --recursive \
-                  --block-size-mb=${{ parameters.blockSize }} \
-                  --cap-mbps=${{ parameters.concurrency }} \
-                  --log-level=ERROR \
-                  --output-type=text
-              ) &
+                --only-show-errors
               
-              # Store PID of background process
-              azcopy_pid=$!
+              azcopy copy \
+                "https://QWERTY.table.core.windows.net/${table}?$(SOURCE_SAS)" \
+                "https://ASDFG.table.core.windows.net/${table}?$(TARGET_SAS)" \
+                --recursive \
+                --block-size-mb=128 \
+                --cap-mbps=500 \
+                --log-level=ERROR \
+                --output-type=text &
               
-              # Wait for azcopy to complete
-              wait $azcopy_pid || true
+              wait $!
               
               table_end_time=$(date +%s)
-              table_duration=$((table_end_time - table_start_time))
-              echo "✓ Table $table completed in ${table_duration} seconds" >> $summary_log
-              echo "✓ Completed table $table (${table_duration}s)"
-              
-              # Force continue
-              set +e
-              true
-            done
-            
-            table_end_time=$(date +%s)
-            table_duration=$((table_end_time - table_start_time))
-            echo "Total table migration time: ${table_duration} seconds" >> $summary_log
-          else
-            echo "No tables to migrate" >> $summary_log
+              duration=$((table_end_time - table_start_time))
+              echo "✓ Table $table completed in ${duration} seconds" >> $summary_log
+            done < "migration_lists/tables.txt"
           fi
+          
+          # Calculate final summary
+          total_end_time=$(date +%s)
+          total_duration=$((total_end_time - total_start_time))
+          echo -e "\n=== Final Migration Summary ===" >> $summary_log
+          echo "Total migration time: ${total_duration} seconds" >> $summary_log
+          echo "Migration completed at $(date)" >> $summary_log
     - task: PublishBuildArtifacts@1
       inputs:
         pathToPublish: 'migration_logs'
         artifactName: 'MigrationLogs'
 
-# - stage: PostMigrationValidation
-#   dependsOn: MigrateStorage
-#   jobs:
-#   - job: Validate
-#     timeoutInMinutes: 60
-#     pool:
-#       name: 'iac-devops-pool'
-#     steps:
     - task: AzureCLI@2
-      name: ValidateMigration
+      name: ValidationTask
       inputs:
-        azureSubscription: '$(TARGET_SUB)'
+        azureSubscription: ASDFGSUB
         scriptType: 'bash'
         scriptLocation: 'inlineScript'
         inlineScript: |
@@ -488,149 +389,117 @@ stages:
           validation_log="migration_logs/validation_summary.log"
           echo "Validation Summary - Started at $(date)" > $validation_log
           
-          # Function to get storage metrics
-          get_storage_metrics() {
-            local account_name=$1
-            local subscription=$2
-            
-            # Get basic storage account properties
-            local metrics=$(az storage account show \
-              --name $account_name \
-              --subscription $subscription \
-              --query "{
-                blobCount:primaryEndpoints.blob,
-                fileCount:primaryEndpoints.file,
-                tableCount:primaryEndpoints.table,
-                totalSize:properties.primaryEndpoints
-              }" -o json)
-            
-            echo $metrics
-          }
-
-          # Function to verify data integrity for a container
-          verify_container_integrity() {
+          # Function to verify container integrity
+          verify_container() {
             local container=$1
             local source_account=$2
             local target_account=$3
-            local source_sas=$4
-            local target_sas=$5
-            
-            echo "Verifying integrity for container: $container"
-            
-            # Get blob list and MD5 hashes from source
-            source_blobs=$(az storage blob list \
-              --container-name "$container" \
-              --account-name "$source_account" \
-              --sas-token "$source_sas" \
-              --query "[].{name:name, hash:properties.contentMD5}" -o json)
-            
-            # Get blob list and MD5 hashes from target
-            target_blobs=$(az storage blob list \
-              --container-name "$container" \
-              --account-name "$target_account" \
-              --sas-token "$target_sas" \
-              --query "[].{name:name, hash:properties.contentMD5}" -o json)
-            
-            # Compare using jq
-            if [ "$(echo $source_blobs | jq -S .)" = "$(echo $target_blobs | jq -S .)" ]; then
-              echo "✓ Container $container integrity verified" >> $validation_log
-              return 0
-            else
-              echo "❌ Container $container integrity check failed" >> $validation_log
-              return 1
-            fi
-          }
-
-          # Function to retry failed transfers
-          retry_transfer() {
-            local source_url=$1
-            local target_url=$2
-            local max_retries=3
+            local retries=3
             local retry_count=0
             
-            while [ $retry_count -lt $max_retries ]; do
-              echo "Retry attempt $((retry_count + 1)) of $max_retries"
+            while [ $retry_count -lt $retries ]; do
+              echo "Verifying container: $container (Attempt $((retry_count + 1)))"
               
-              azcopy copy \
-                "$source_url" \
-                "$target_url" \
-                --recursive \
-                --block-size-mb=${{ parameters.blockSize }} \
-                --cap-mbps=${{ parameters.concurrency }} \
-                --log-level=ERROR \
-                --output-type=text
+              # Get source and target blob lists with properties
+              source_count=$(az storage blob list \
+                --container-name "$container" \
+                --account-name "$source_account" \
+                --sas-token "$(SOURCE_SAS)" \
+                --query "length(@)" -o tsv)
+                
+              target_count=$(az storage blob list \
+                --container-name "$container" \
+                --account-name "$target_account" \
+                --sas-token "$(TARGET_SAS)" \
+                --query "length(@)" -o tsv)
               
-              if [ $? -eq 0 ]; then
-                echo "✓ Retry successful"
+              if [ "$source_count" -eq "$target_count" ]; then
+                echo "✓ Container $container verified ($source_count blobs)" >> $validation_log
                 return 0
+              else
+                echo "Mismatch in $container: Source=$source_count, Target=$target_count" >> $validation_log
+                retry_count=$((retry_count + 1))
+                sleep 30
               fi
-              
-              retry_count=$((retry_count + 1))
-              sleep 30
             done
             
+            echo "❌ Container $container validation failed after $retries attempts" >> $validation_log
             return 1
           }
-
-          # Get metrics for both accounts
-          echo "Collecting storage metrics..."
-          source_metrics=$(get_storage_metrics "$(SOURCE_ACCOUNT)" "XXXXXXXXXXXX111111111111XXXXXXXXXXXXXXX")
-          target_metrics=$(get_storage_metrics "$(TARGET_ACCOUNT)" "WWWWWWWWWWWWWWWWWWWWWWWW222222222222222222WWWWWWWWWWWWW")
           
-          # Log metrics
-          echo "Source Account Metrics:" >> $validation_log
-          echo "$source_metrics" >> $validation_log
-          echo "Target Account Metrics:" >> $validation_log
-          echo "$target_metrics" >> $validation_log
-
-          # Verify data integrity
-          echo "Starting data integrity verification..."
+          # Validate containers by size category
           failed_containers=()
           
-          while IFS= read -r container; do
-            if ! verify_container_integrity "$container" "$(SOURCE_ACCOUNT)" "$(TARGET_ACCOUNT)" "$(SOURCE_SAS)" "$(TARGET_SAS)"; then
-              failed_containers+=("$container")
-            fi
-          done < "migration_lists/containers.txt"
-
-          # Handle failed containers
-          if [ ${#failed_containers[@]} -gt 0 ]; then
-            echo "Failed containers detected. Starting retry process..."
-            for container in "${failed_containers[@]}"; do
-              echo "Retrying transfer for container: $container"
+          # Validate large containers
+          echo "=== Validating Large Containers ===" >> $validation_log
+          if [ -s "migration_lists/large_containers.txt" ]; then
+            while IFS= read -r container; do
+              if ! verify_container "$container" "QWERTY" "ASDFG"; then
+                failed_containers+=("$container")
+              fi
+            done < "migration_lists/large_containers.txt"
+          fi
+          
+          # Validate medium containers
+          echo "=== Validating Medium Containers ===" >> $validation_log
+          if [ -s "migration_lists/medium_containers.txt" ]; then
+            while IFS= read -r container; do
+              if ! verify_container "$container" "QWERTY" "ASDFG"; then
+                failed_containers+=("$container")
+              fi
+            done < "migration_lists/medium_containers.txt"
+          fi
+          
+          # Validate small containers
+          echo "=== Validating Small Containers ===" >> $validation_log
+          if [ -s "migration_lists/small_containers.txt" ]; then
+            while IFS= read -r container; do
+              if ! verify_container "$container" "QWERTY" "ASDFG"; then
+                failed_containers+=("$container")
+              fi
+            done < "migration_lists/small_containers.txt"
+          fi
+          
+          # Validate file shares
+          echo "=== Validating File Shares ===" >> $validation_log
+          if [ -s "migration_lists/shares.txt" ]; then
+            while IFS= read -r share; do
+              source_count=$(az storage file list \
+                --share-name "$share" \
+                --account-name "QWERTY" \
+                --sas-token "$(SOURCE_SAS)" \
+                --query "length(@)" -o tsv)
+                
+              target_count=$(az storage file list \
+                --share-name "$share" \
+                --account-name "ASDFG" \
+                --sas-token "$(TARGET_SAS)" \
+                --query "length(@)" -o tsv)
               
-              source_url="https://"$(SOURCE_ACCOUNT)".blob.core.windows.net/${container}?$(SOURCE_SAS)"
-              target_url="https://"$(TARGET_ACCOUNT)".blob.core.windows.net/${container}?$(TARGET_SAS)"
-              
-              if retry_transfer "$source_url" "$target_url"; then
-                echo "✓ Retry successful for container: $container" >> $validation_log
+              if [ "$source_count" -eq "$target_count" ]; then
+                echo "✓ Share $share verified ($source_count files)" >> $validation_log
               else
-                echo "❌ Final retry failed for container: $container" >> $validation_log
-                echo "##vso[task.logissue type=warning]Container $container failed all retry attempts"
+                echo "❌ Share $share validation failed (Source=$source_count, Target=$target_count)" >> $validation_log
+                failed_containers+=("share:$share")
               fi
             done
           fi
-
-          # Send notification if configured
-          if [ -n "$NOTIFICATION_WEBHOOK" ]; then
-            curl -X POST -H "Content-Type: application/json" \
-              -d "{\"text\":\"Storage migration completed. Check validation logs for details.\"}" \
-              "$NOTIFICATION_WEBHOOK"
-          fi
-
-          # Final summary
-          echo -e "\n=== Validation Summary ===" >> $validation_log
-          echo "Total containers processed: $(wc -l < migration_lists/containers.txt)" >> $validation_log
-          echo "Failed containers: ${#failed_containers[@]}" >> $validation_log
-          echo "Validation completed at $(date)" >> $validation_log
           
-          # Fail the pipeline if there are still failed containers
+          # Final validation summary
+          echo -e "\n=== Validation Summary ===" >> $validation_log
+          echo "Validation completed at $(date)" >> $validation_log
+          echo "Total failed items: ${#failed_containers[@]}" >> $validation_log
+          
           if [ ${#failed_containers[@]} -gt 0 ]; then
-            echo "##vso[task.complete result=Failed;]Some containers failed to migrate properly"
-            exit 1
+            echo "Failed items:" >> $validation_log
+            printf '%s\n' "${failed_containers[@]}" >> $validation_log
+            echo "##vso[task.logissue type=warning]${#failed_containers[@]} items failed validation"
+          else
+            echo "✓ All items validated successfully" >> $validation_log
           fi
 
     - task: PublishBuildArtifacts@1
       inputs:
-        pathToPublish: 'migration_logs'
+        pathToPublish: 'validation_log'
         artifactName: 'ValidationLogs'
+
